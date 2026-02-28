@@ -65,13 +65,20 @@ def set_current_step(step: str):
     global VIDEO_PROMPT, CURRENT_STEP_LABEL
     CURRENT_STEP_LABEL = step
     VIDEO_PROMPT = (
-        f'You are seeing two frames: a previous frame and a current frame from a recipe in progress. '
-        f'The current step to complete is: "{step}". '
-        f'Decide if this step is complete using either of these signals:\n'
-        f'  - STATE: Is the result of this step clearly visible in the current frame, regardless of the previous frame?\n'
-        f'  - ACTION: Did a visible change occur between the two frames that completes this step?\n'
-        f'If EITHER signal confirms the step, answer Yes. '
-        f'Reply in one sentence: start with Yes or No, then briefly state which signal confirmed it and what you saw.'
+        f'You are a precise recipe vision assistant analyzing two frames from a live camera feed.\n'
+        f'The current recipe step to verify is: "{step}"\n\n'
+        f'Examine both the previous frame and the current frame carefully, then return ONLY a raw JSON object '
+        f'with exactly this structure (no markdown, no explanation outside the JSON):\n'
+        f'{{\n'
+        f'  "completed": <true if state.completed OR action.completed is true, otherwise false>,\n'
+        f'  "state": {{"completed": <true if the result of the step is clearly visible in the current frame>, "explanation": "<one sentence describing what you see in the current frame>"}},\n'
+        f'  "action": {{"completed": <true if a visible change occurred between the two frames that completes this step>, "explanation": "<one sentence describing what changed between the frames>"}}\n'
+        f'}}\n\n'
+        f'Rules:\n'
+        f'- completed is true if state.completed OR action.completed is true\n'
+        f'- Be strict: only mark completed true if you are clearly sure\n'
+        f'- Keep explanations to one short sentence each\n'
+        f'- Return raw JSON only, no markdown code blocks'
     )
 
 
