@@ -12,6 +12,9 @@ client = OpenAI()
 conversation_history = []
 MAX_HISTORY = 20  # max messages kept (= 10 back-and-forth exchanges)
 
+# The last frame sent to GPT — included as "previous frame" in every subsequent call
+_previous_frame = None
+
 
 def ai_text_output(prompt):
     response = client.chat.completions.create(
@@ -72,19 +75,33 @@ def ai_vision_audio_query(text_prompt, frame=None, system_prompt=None, stream=Fa
     # Inject prior conversation (text-only — images not stored to save tokens)
     messages.extend(conversation_history)
 
-    # Build the current user message (with image if available)
+    # Build the current user message
     if frame is not None:
-        image_b64 = _encode_frame(frame)
-        content = [
-            {
+        global _previous_frame
+        content = []
+
+        # Include previous frame first so GPT can see the transition
+        if _previous_frame is not None:
+            content.append({"type": "text", "text": "Previous frame:"})
+            content.append({
                 "type": "image_url",
                 "image_url": {
-                    "url": f"data:image/jpeg;base64,{image_b64}",
+                    "url": f"data:image/jpeg;base64,{_encode_frame(_previous_frame)}",
                     "detail": "low",
                 },
+            })
+
+        content.append({"type": "text", "text": "Current frame:"})
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{_encode_frame(frame)}",
+                "detail": "low",
             },
-            {"type": "text", "text": text_prompt},
-        ]
+        })
+        content.append({"type": "text", "text": text_prompt})
+
+        _previous_frame = frame.copy()
     else:
         content = text_prompt
 
