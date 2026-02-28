@@ -56,8 +56,24 @@ MIN_SPEECH_SECONDS = 0.5   # discard clips shorter than this (noise/clicks)
 VIDEO_INTERVAL = 3.0  # seconds between video-only GPT snapshots
 
 
-# IMPORTANT
-VIDEO_PROMPT  = "In one short sentence, is the user pointing their index finger? Answer yes or no and state what you see."
+# Updated by set_current_step() as the user progresses through a recipe
+VIDEO_PROMPT       = "You are seeing a previous frame and a current frame. In one sentence, describe what changed between the two frames in terms of food preparation."
+CURRENT_STEP_LABEL = None  # human-readable label printed in terminal during testing
+
+def set_current_step(step: str):
+    """Update the VIDEO_PROMPT to check for the current recipe step using two-frame comparison."""
+    global VIDEO_PROMPT, CURRENT_STEP_LABEL
+    CURRENT_STEP_LABEL = step
+    VIDEO_PROMPT = (
+        f'You are seeing two frames: a previous frame and a current frame from a recipe in progress. '
+        f'The current step to complete is: "{step}". '
+        f'Decide if this step is complete using either of these signals:\n'
+        f'  - STATE: Is the result of this step clearly visible in the current frame, regardless of the previous frame?\n'
+        f'  - ACTION: Did a visible change occur between the two frames that completes this step?\n'
+        f'If EITHER signal confirms the step, answer Yes. '
+        f'Reply in one sentence: start with Yes or No, then briefly state which signal confirmed it and what you saw.'
+    )
+
 
 audio_queue        = queue.Queue()
 transcription_queue = queue.Queue()  # raw audio buffers ready to transcribe
@@ -184,7 +200,17 @@ def gpt_worker(system_prompt=None):
         except queue.Empty:
             continue
 
-        print(f"[GPT] Sending: '{text}'")
+        # Print a clean label so it's easy to read during testing
+        if not remember:
+            # Video step-check
+            label = CURRENT_STEP_LABEL or "general observation"
+            print(f"\n[Step Check] '{label}'")
+            print(f"[AI] ", end="", flush=True)
+        else:
+            # Speech query
+            print(f"\n[You said] '{text}'")
+            print(f"[AI] ", end="", flush=True)
+
         try:
             for chunk in ai_vision_audio_query(
                 text, frame=frame, system_prompt=system_prompt, stream=True, remember=remember
@@ -302,5 +328,3 @@ def get_camo_feed(camera_index=None, audio_device_index=None, system_prompt=None
     cv2.destroyAllWindows()
 
 
-if __name__ == "__main__":
-    get_camo_feed()

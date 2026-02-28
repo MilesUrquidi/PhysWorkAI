@@ -138,3 +138,82 @@ def _append_history(user_text, assistant_text):
     if len(conversation_history) > MAX_HISTORY:
         # Drop oldest pair to stay within the window
         del conversation_history[:2]
+
+
+# ---------------------------------------------------------------------------
+# Task decomposition
+# ---------------------------------------------------------------------------
+
+_TASK_DECOMP_SYSTEM = """You are a recipe decomposition engine for a real-time AI vision cooking assistant.
+Given a food or drink to make, break it into ordered preparation steps that a camera can verify one frame at a time.
+
+Rules for every step:
+- Describes a single visible state of ingredients or tools (not an action in motion)
+- Can be confirmed TRUE or FALSE from one video frame (e.g. "bread is on the plate", "ice is in the glass")
+- Written as one short imperative sentence (max 10 words)
+- No time-based instructions ("wait 2 minutes") — visible state only
+- Cover the full recipe from start to finish
+
+Return ONLY a raw JSON array of strings. No markdown, no explanation, no extra keys."""
+
+_TASK_DECOMP_EXAMPLES = [
+    {
+        "role": "user",
+        "content": "Task: Make a peanut butter and jelly sandwich"
+    },
+    {
+        "role": "assistant",
+        "content": '["Two slices of bread are laid flat on a surface", "Peanut butter is spread across one slice", "Jelly is spread across the other slice", "Both slices are pressed together face-down"]'
+    },
+    {
+        "role": "user",
+        "content": "Task: Make iced coffee"
+    },
+    {
+        "role": "assistant",
+        "content": '["A glass is placed on a flat surface", "Glass is filled with ice cubes", "Coffee is poured over the ice", "Milk or creamer is added to the glass", "Drink is stirred with a spoon"]'
+    },
+    {
+        "role": "user",
+        "content": "Task: Make a bowl of cereal"
+    },
+    {
+        "role": "assistant",
+        "content": '["A bowl is placed on a flat surface", "Cereal is poured into the bowl", "Milk is poured over the cereal"]'
+    },
+    {
+        "role": "user",
+        "content": "Task: Make avocado toast"
+    },
+    {
+        "role": "assistant",
+        "content": '["A slice of bread is placed on a flat surface", "Bread is toasted and placed back on the surface", "Avocado is scooped and spread across the toast", "Salt and pepper are sprinkled on top"]'
+    },
+]
+
+
+def generate_task_steps(task: str) -> list[str]:
+    """
+    Break a physical task into a list of frame-verifiable steps using GPT.
+
+    Args:
+        task: Natural language description of the task (e.g. "do a squat").
+
+    Returns:
+        List of step strings in order, e.g.:
+        ["Stand with feet shoulder-width apart", "Lower hips to parallel", ...]
+    """
+    import json
+
+    messages = [{"role": "system", "content": _TASK_DECOMP_SYSTEM}]
+    messages.extend(_TASK_DECOMP_EXAMPLES)
+    messages.append({"role": "user", "content": f"Task: {task}"})
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        temperature=0.3,  # low temp = consistent, structured output
+    )
+
+    raw = response.choices[0].message.content.strip()
+    return json.loads(raw)
