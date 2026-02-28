@@ -4,8 +4,9 @@ import numpy as np
 import threading
 import queue
 import io
+import time
 import wave
-import speech_recognition as sr
+from chatgpt import ai_vision_audio_query, transcribe_audio
 
 
 # --- Device discovery ---
@@ -42,14 +43,31 @@ def find_camo_audio_device():
 
 # --- Audio capture (runs in its own thread) ---
 
-SAMPLE_RATE = 16000   # 16kHz is ideal for speech recognition
-CHANNELS = 1
-AUDIO_CHUNK = 1024
-TRANSCRIBE_SECONDS = 3  # Transcribe every N seconds of audio
+SAMPLE_RATE    = 16000  # 16kHz is ideal for speech recognition
+CHANNELS       = 1
+AUDIO_CHUNK    = 1024
 
-audio_queue = queue.Queue()
-transcription_queue = queue.Queue()  # Holds raw audio buffers ready to transcribe
-audio_running = threading.Event()
+# VAD settings
+SILENCE_THRESHOLD  = 0.02  # RMS below this is silence (float32 audio, range 0-1)
+SILENCE_DURATION   = 0.8   # seconds of silence that marks end of utterance
+MIN_SPEECH_SECONDS = 0.5   # discard clips shorter than this (noise/clicks)
+
+# Periodic video analysis
+VIDEO_INTERVAL = 3.0  # seconds between video-only GPT snapshots
+VIDEO_PROMPT   = "Briefly analyze what is in the image. Is the user completing the task of pointing his index finger?"
+
+audio_queue        = queue.Queue()
+transcription_queue = queue.Queue()  # raw audio buffers ready to transcribe
+gpt_input_queue    = queue.Queue()   # (text, frame) pairs ready for GPT
+audio_running      = threading.Event()
+
+# Shared latest video frame — updated every frame by the main loop
+latest_frame      = None
+latest_frame_lock = threading.Lock()
+
+# VU meter level — updated by the audio thread, read by the main loop
+vu_level      = 0.0
+vu_level_lock = threading.Lock()
 
 
 def audio_callback(indata, frames, time, status):
@@ -60,12 +78,15 @@ def audio_callback(indata, frames, time, status):
 
 
 def start_audio_stream(device_index):
-    """Capture audio and batch it into TRANSCRIBE_SECONDS chunks."""
+    """Capture audio with VAD — emit complete utterances when the user stops talking."""
     audio_running.set()
     print(f"[Audio] Streaming from device index {device_index}")
 
-    buffer = []
-    samples_needed = SAMPLE_RATE * TRANSCRIBE_SECONDS
+    speech_buffer  = []
+    silence_count  = 0
+    is_speaking    = False
+    silence_limit      = int(SAMPLE_RATE * SILENCE_DURATION / AUDIO_CHUNK)
+    min_speech_chunks  = int(SAMPLE_RATE * MIN_SPEECH_SECONDS / AUDIO_CHUNK)
 
     with sd.InputStream(
         device=device_index,
@@ -77,22 +98,41 @@ def start_audio_stream(device_index):
         while audio_running.is_set():
             try:
                 chunk = audio_queue.get(timeout=0.5)
-                buffer.append(chunk)
-                total_samples = sum(c.shape[0] for c in buffer)
-                if total_samples >= samples_needed:
-                    audio_data = np.concatenate(buffer, axis=0)
-                    transcription_queue.put(audio_data.copy())
-                    buffer = []
             except queue.Empty:
                 continue
+
+            rms = float(np.sqrt(np.mean(chunk ** 2)))
+
+            # Update VU meter for the main video loop
+            with vu_level_lock:
+                global vu_level
+                vu_level = rms
+
+            if rms > SILENCE_THRESHOLD:
+                if not is_speaking:
+                    print("[Audio] Speech detected...")
+                is_speaking   = True
+                silence_count = 0
+                speech_buffer.append(chunk)
+            else:
+                if is_speaking:
+                    speech_buffer.append(chunk)
+                    silence_count += 1
+                    if silence_count >= silence_limit:
+                        # User stopped talking — ship the utterance
+                        if len(speech_buffer) >= min_speech_chunks:
+                            audio_data = np.concatenate(speech_buffer, axis=0)
+                            transcription_queue.put(audio_data.copy())
+                            print("[Audio] Utterance complete, queued for transcription.")
+                        speech_buffer = []
+                        silence_count = 0
+                        is_speaking   = False
 
     print("[Audio] Stream stopped.")
 
 
 def transcribe_worker():
-    """Continuously pull audio buffers and transcribe them to text."""
-    recognizer = sr.Recognizer()
-
+    """Continuously pull audio buffers, transcribe via Whisper, then queue for GPT."""
     while audio_running.is_set() or not transcription_queue.empty():
         try:
             audio_data = transcription_queue.get(timeout=1)
@@ -107,32 +147,63 @@ def transcribe_worker():
             wf.setsampwidth(2)  # 16-bit
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(pcm.tobytes())
-        wav_buffer.seek(0)
-
-        audio_source = sr.AudioFile(wav_buffer)
-        with audio_source as source:
-            audio = recognizer.record(source)
 
         try:
-            text = recognizer.recognize_google(audio)
-            if text.strip():
+            text = transcribe_audio(wav_buffer)
+            if text:
                 print(f"[Transcript] {text}")
-        except sr.UnknownValueError:
-            pass  # Silence or unintelligible audio — skip
-        except sr.RequestError as e:
-            print(f"[Transcript] Google API error: {e}")
+                with latest_frame_lock:
+                    frame_copy = latest_frame.copy() if latest_frame is not None else None
+                gpt_input_queue.put((text, frame_copy, True))  # remember=True
+        except Exception as e:
+            print(f"[Transcript] Whisper error: {e}")
+
+
+# --- Periodic video worker ---
+
+def video_worker():
+    """Send the latest frame to GPT every VIDEO_INTERVAL seconds for passive form analysis."""
+    while audio_running.is_set():
+        time.sleep(VIDEO_INTERVAL)
+        with latest_frame_lock:
+            frame_copy = latest_frame.copy() if latest_frame is not None else None
+        if frame_copy is not None:
+            gpt_input_queue.put((VIDEO_PROMPT, frame_copy, False))  # remember=False
+
+
+# --- GPT worker ---
+
+def gpt_worker(system_prompt=None):
+    """Pull (text, frame, remember) tuples from gpt_input_queue and send to GPT-4o."""
+    while audio_running.is_set() or not gpt_input_queue.empty():
+        try:
+            text, frame, remember = gpt_input_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+
+        print(f"[GPT] Sending: '{text}'")
+        try:
+            for chunk in ai_vision_audio_query(
+                text, frame=frame, system_prompt=system_prompt, stream=True, remember=remember
+            ):
+                print(chunk, end="", flush=True)
+            print()  # newline after streamed response
+        except Exception as e:
+            print(f"[GPT] Error: {e}")
 
 
 # --- Main feed ---
 
-def get_camo_feed(camera_index=None, audio_device_index=None):
+def get_camo_feed(camera_index=None, audio_device_index=None, system_prompt=None):
     """
     Capture video + audio from Camo (phone streamed to Mac).
-    Transcribes speech to text and prints it to the console.
+    Transcribes speech, pairs it with the latest video frame, and sends
+    both to GPT-4o for real-time analysis.
 
     Args:
         camera_index:       Video device index. Auto-detected if None.
         audio_device_index: Audio device index. Auto-detected if None.
+        system_prompt:      Optional system message passed to GPT-4o on every call.
 
     Press 'q' to quit.
     """
@@ -167,7 +238,7 @@ def get_camo_feed(camera_index=None, audio_device_index=None):
                 print(f"  [{idx}] {name} ({ch} ch)")
             print("[Audio] Continuing without audio. Pass audio_device_index= to enable.")
 
-    # Start audio + transcription threads
+    # Start audio + transcription + GPT threads
     if audio_device_index is not None:
         audio_running.set()
 
@@ -180,10 +251,21 @@ def get_camo_feed(camera_index=None, audio_device_index=None):
             target=transcribe_worker,
             daemon=True,
         )
+        gpt_thread = threading.Thread(
+            target=gpt_worker,
+            kwargs={"system_prompt": system_prompt},
+            daemon=True,
+        )
+        video_thread = threading.Thread(
+            target=video_worker,
+            daemon=True,
+        )
         audio_thread.start()
         transcribe_thread.start()
+        gpt_thread.start()
+        video_thread.start()
 
-    print(f"[Feed] Started — transcribing every {TRANSCRIBE_SECONDS}s. Press 'q' to quit.\n")
+    print(f"[Feed] Started — VAD active, video snapshot every {VIDEO_INTERVAL}s. Press 'q' to quit.\n")
 
     while True:
         ret, frame = cap.read()
@@ -191,11 +273,14 @@ def get_camo_feed(camera_index=None, audio_device_index=None):
             print("[Video] Failed to read frame.")
             break
 
-        # VU meter: drain audio_queue for level display
-        level = 0
-        while not audio_queue.empty():
-            chunk = audio_queue.get_nowait()
-            level = int(np.abs(chunk).mean() * 2000)
+        # Keep latest frame available for GPT worker
+        with latest_frame_lock:
+            global latest_frame
+            latest_frame = frame.copy()
+
+        # VU meter: read level published by the audio thread
+        with vu_level_lock:
+            level = int(vu_level * 2000)
 
         level = min(level, frame.shape[1] - 20)
         cv2.rectangle(frame, (10, frame.shape[0] - 20), (10 + level, frame.shape[0] - 10),
