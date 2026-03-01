@@ -6,6 +6,8 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
+import { Separator } from "@/components/ui/separator";
+import { Skeleton } from "@/components/ui/skeleton";
 
 // Palette
 // #2C5F2E — deep forest green (primary)
@@ -23,6 +25,7 @@ type StepCheckData = {
   completed: boolean;
   state: { completed: boolean; explanation: string };
   action: { completed: boolean; explanation: string };
+  hint?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -67,6 +70,8 @@ export default function Home() {
   // ── Real data from backend ─────────────────────────────────────
   const [steps, setSteps] = useState<string[]>([]);
   const [stepDetails, setStepDetails] = useState<Record<string, string>>({});
+  const [stepImages, setStepImages] = useState<Record<string, string>>({});
+  const [recipeName, setRecipeName] = useState("");
   const [remySpeech, setRemySpeech] = useState<string>("");
   const [stepCompleted, setStepCompleted] = useState(false);
   const [stepCheckData, setStepCheckData] = useState<StepCheckData | null>(null);
@@ -78,7 +83,7 @@ export default function Home() {
 
   const eventSourceRef = useRef<EventSource | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const handleNextRef = useRef<() => Promise<void>>(async () => {});
+  const handleNextRef = useRef<() => Promise<void>>(async () => { });
   const currentStepLabelRef = useRef<string>("");
 
   // Cleanup SSE on unmount
@@ -105,7 +110,7 @@ export default function Home() {
       handleNextRef.current();
     }, 1500);
     return () => clearTimeout(timer);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stepCompleted]);
 
   // ── SSE connection ─────────────────────────────────────────────
@@ -119,8 +124,9 @@ export default function Home() {
         const msg = JSON.parse(event.data);
 
         if (msg.type === "step_check") {
-          // Ignore stale results from a previous step
-          if (msg.step && msg.step !== currentStepLabelRef.current) return;
+          // Ignore stale results — require step label to match current step.
+          // If msg.step is null/undefined (queued before set-step was called), discard it.
+          if (!msg.step || msg.step !== currentStepLabelRef.current) return;
 
           // Backend strips markdown fences before sending, but handle
           // string fallback here too in case GPT slips through anyway.
@@ -128,20 +134,24 @@ export default function Home() {
           let data: any = msg.data;
           if (typeof data === "string") {
             try {
-              const stripped = data.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/,"").trim();
+              const stripped = data.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
               data = JSON.parse(stripped);
             } catch { data = null; }
           }
           if (data && typeof data === "object") {
             setStepCheckData(data as StepCheckData);
-            if (data.completed) setStepCompleted(true);
+            if (data.completed === true) setStepCompleted(true);
           }
         } else if (msg.type === "speech") {
           const text = (msg.data as string).trim();
           // Ignore JSON responses — these are step-check bleed from false VAD triggers
-          if (!text.startsWith("{") && !text.startsWith("```")) {
-            setRemySpeech(text);
-          }
+          if (text.startsWith("{") || text.startsWith("```") || text.startsWith("[")) return;
+          // Extra guard: try parsing as JSON — if it has step-check keys, skip it
+          try {
+            const parsed = JSON.parse(text);
+            if (parsed && typeof parsed === "object" && ("completed" in parsed || "state" in parsed || "action" in parsed)) return;
+          } catch { /* not JSON — good, it's real speech */ }
+          setRemySpeech(text);
         }
       } catch {
         // ignore malformed frames
@@ -179,35 +189,19 @@ export default function Home() {
           duration: 8000,
           icon: "⚠️",
         });
+  async function loadStepImage(step: string, recipe?: string) {
+    if (stepImages[step]) return; // already loaded
+    try {
+      let url = `${BACKEND_URL}/step/image?step=${encodeURIComponent(step)}`;
+      if (recipe) url += `&recipe=${encodeURIComponent(recipe)}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data.image_url) {
+        setStepImages(prev => ({ ...prev, [step]: data.image_url }));
       }
     } catch {
       // optional — fine to fail silently
     }
-  }
-
-  // ── Start camera + SSE + go to coaching ───────────────────────
-
-  async function startCooking(stepsToUse: string[]) {
-    await fetch(`${BACKEND_URL}/camera/start`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    await fetch(`${BACKEND_URL}/recipe/set-step`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ step: stepsToUse[0] }),
-    });
-    connectSSE();
-    setCurrentStep(0);
-    setDisplayStep(0);
-    setStepCompleted(false);
-    setStepCheckData(null);
-    setRemySpeech("");
-    setCameraActive(true);
-    crossFadeTo("coaching");
-    loadStepDetails(stepsToUse[0]);
-    loadStepCaution(stepsToUse[0]);
   }
 
   // ── Navigation helpers ─────────────────────────────────────────
@@ -252,6 +246,7 @@ export default function Home() {
 
     try {
       const food = inputMode === "describe" ? prompt.trim() : recipeUrl.trim();
+      setRecipeName(food);
 
       // 1. Generate steps + scan allergens in parallel
       const [genRes, allergenRes] = await Promise.all([
@@ -284,6 +279,9 @@ export default function Home() {
 
       // 3. No allergens — go straight to cooking
       await startCooking(newSteps);
+      // 5. Load first step details + image in background
+      loadStepDetails(newSteps[0]);
+      loadStepImage(newSteps[0], food);
 
     } catch (err) {
       clearInterval(interval);
@@ -327,10 +325,10 @@ export default function Home() {
     eventSourceRef.current?.close();
     setCameraActive(false);
     setShowCompletionOverlay(false);
-    try { await fetch(`${BACKEND_URL}/camera/stop`, { method: "POST" }); } catch {}
+    try { await fetch(`${BACKEND_URL}/camera/stop`, { method: "POST" }); } catch { }
     setPrompt(""); setRecipeUrl(""); setUrlParsed(false);
     setCurrentStep(0); setDisplayStep(0); setDone(false);
-    setSteps([]); setStepDetails({}); setRemySpeech("");
+    setSteps([]); setStepDetails({}); setStepImages({}); setRecipeName(""); setRemySpeech("");
     setStepCompleted(false); setStepCheckData(null);
     setDetectedAllergens([]); setSelectedAllergens([]);
     crossFadeTo("prompt");
@@ -346,7 +344,7 @@ export default function Home() {
     if (nextIdx >= steps.length) {
       eventSourceRef.current?.close();
       setCameraActive(false);
-      try { await fetch(`${BACKEND_URL}/camera/stop`, { method: "POST" }); } catch {}
+      try { await fetch(`${BACKEND_URL}/camera/stop`, { method: "POST" }); } catch { }
       setDone(true);
       return;
     }
@@ -361,7 +359,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ step: steps[nextIdx] }),
       });
-    } catch {}
+    } catch { }
 
     setCurrentStep(nextIdx);
     setTimeout(() => {
@@ -369,6 +367,7 @@ export default function Home() {
       setAnimating(false);
       loadStepDetails(steps[nextIdx]);
       loadStepCaution(steps[nextIdx]);
+      loadStepImage(steps[nextIdx], recipeName);
     }, 400);
   }
 
@@ -387,20 +386,11 @@ export default function Home() {
           .spinner { animation: spin 0.8s linear infinite; }
         `}</style>
 
-        <div className="flex-1 flex flex-col items-center justify-center gap-7 px-12">
+        <div className="flex-1 flex flex-col items-center justify-center gap-7 px-12 mb-20">
 
-          {/* Brand */}
+          {/* Heading */}
           <div className="w-full max-w-lg flex flex-col items-center gap-2 text-center">
-            <div className="flex items-center gap-3 mb-1">
-              <span className="text-5xl">🐀</span>
-              <span className="text-6xl font-bold tracking-tight" style={{ color: "#2C5F2E" }}>Remy</span>
-            </div>
-            <p className="text-base font-medium" style={{ color: "#97BC62" }}>your AI sous chef</p>
-            <div className="w-12 h-0.5 rounded-full my-2" style={{ background: "#D4A017" }} />
             <h1 className="text-2xl font-semibold" style={{ color: "#3a3a2a" }}>What are we cooking?</h1>
-            <p className="text-sm" style={{ color: "#97BC62" }}>
-              Tell Remy what you want to make — he'll guide you through it hands-free.
-            </p>
           </div>
 
           {/* Error banner */}
@@ -416,10 +406,10 @@ export default function Home() {
               <button
                 key={mode}
                 onClick={() => switchMode(mode)}
-                className="flex-1 rounded-xl py-2 text-sm font-semibold transition-all"
+                className="flex-1 rounded-xl py-2 text-sm font-semibold transition-all duration-200 ease-out"
                 style={{
                   background: inputMode === mode ? "#fff" : "transparent",
-                  color: inputMode === mode ? "#2C5F2E" : "#97BC62",
+                  color: inputMode === mode ? "#3a3a2a" : "#3a3a2a",
                   boxShadow: inputMode === mode ? "0 1px 4px #0001" : "none",
                 }}
               >
@@ -433,8 +423,8 @@ export default function Home() {
             {inputMode === "describe" ? (
               <textarea
                 autoFocus
-                className="w-full text-base rounded-2xl px-4 py-3 resize-none outline-none leading-relaxed h-36 focus:ring-2"
-                style={{ background: "#fff", color: "#3a3a2a", border: "1.5px solid #97BC62", caretColor: "#D4A017" }}
+                className="w-full text-base rounded-2xl px-4 py-3 resize-none outline-none leading-relaxed h-36"
+                style={{ background: "#fff", color: "#3a3a2a", border: "1px solid #fff", caretColor: "#D4A017" }}
                 placeholder="e.g. Spaghetti carbonara, chocolate chip cookies, chicken stir fry…"
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
@@ -444,9 +434,9 @@ export default function Home() {
               <div className="flex flex-col gap-3">
                 <div
                   className="flex items-center gap-3 rounded-2xl px-4 py-3"
-                  style={{ background: "#fff", border: `1.5px solid ${urlParsed ? "#2C5F2E" : "#97BC62"}` }}
+                  style={{ background: "#fff", border: `1px solid ${urlParsed ? "#2C5F2E" : "#fff"}` }}
                 >
-                  <svg className="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="#97BC62" strokeWidth={1.5}>
+                  <svg className="w-7 h-7 shrink-0 pb-1" fill="none" viewBox="0 0 30 30" stroke="#97BC62" strokeWidth={1.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101" />
                     <path strokeLinecap="round" strokeLinejoin="round" d="M10.172 13.828a4 4 0 015.656 0l4 4a4 4 0 01-5.656 5.656l-1.102-1.101" />
                   </svg>
@@ -486,7 +476,7 @@ export default function Home() {
           <button
             onClick={handleStart}
             disabled={!canStart()}
-            className="w-full max-w-lg rounded-2xl py-3 text-base font-semibold transition-all disabled:opacity-30 disabled:cursor-not-allowed hover:brightness-110 active:scale-[0.98]"
+            className="w-full max-w-lg rounded-2xl py-3 text-base font-semibold transition-all duration-200 ease-out disabled:opacity-30 disabled:cursor-not-allowed hover:brightness-110 hover:scale-[1.01] active:scale-[0.98]"
             style={{ background: "#D4A017", color: "#fff" }}
           >
             Let&apos;s Cook →
@@ -644,14 +634,13 @@ export default function Home() {
               eventSourceRef.current?.close();
               setPrompt(""); setRecipeUrl(""); setUrlParsed(false);
               setCurrentStep(0); setDisplayStep(0); setDone(false);
-              setSteps([]); setStepDetails({}); setRemySpeech("");
+              setSteps([]); setStepDetails({}); setStepImages({}); setRecipeName(""); setRemySpeech("");
               setStepCompleted(false); setStepCheckData(null);
               setDetectedAllergens([]); setSelectedAllergens([]);
               setCameraActive(false);
               crossFadeTo("prompt");
             }}
-            className="mt-4 rounded-2xl px-8 py-3 text-sm font-medium transition-all hover:brightness-110"
-            style={{ background: "#97BC62", color: "#2C5F2E" }}
+            className="mt-4 rounded-2xl px-8 py-3 text-sm font-medium transition-all duration-200 ease-out hover:brightness-110 hover:scale-[1.02] active:scale-[0.98] text-neutral-50 bg-neutral-800"
           >
             Cook something else
           </button>
@@ -664,6 +653,7 @@ export default function Home() {
 
   const currentStepLabel = steps[displayStep] ?? "";
   const currentStepDetail = stepDetails[currentStepLabel];
+  const currentStepImage = stepImages[currentStepLabel];
 
   return (
     <>
@@ -713,8 +703,8 @@ export default function Home() {
                 <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
               </svg>
             </div>
-            <p className="text-4xl font-bold tracking-tight" style={{ color: "#fff" }}>Step Complete!</p>
-            <p className="text-base font-medium opacity-70" style={{ color: "#fff" }}>Moving to next step…</p>
+            <p className="text-4xl font-bold tracking-tight " style={{ color: "#fff" }}>Step Complete!</p>
+            <p className="text-base font-medium opacity-70 " style={{ color: "#fff" }}>Moving to next step…</p>
           </div>
         </div>
       )}
@@ -725,7 +715,7 @@ export default function Home() {
         {/* End recipe button */}
         <button
           onClick={handleEndRecipe}
-          className="absolute top-5 right-5 z-20 flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold transition-all hover:brightness-90 active:scale-95"
+          className="absolute top-5 right-5 z-20 flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold transition-all duration-200 ease-out hover:brightness-90 hover:scale-[1.02] active:scale-95"
           style={{ background: "#e8e0d8", color: "#7a6a5a" }}
         >
           ✕ End Recipe
@@ -735,10 +725,6 @@ export default function Home() {
 
           {/* Header */}
           <div className="pt-7 pb-0 flex flex-col items-center gap-2">
-            <div className="flex items-center gap-2">
-              <span className="text-2xl">🐀</span>
-              <span className="text-3xl font-bold tracking-tight" style={{ color: "#2C5F2E" }}>Remy</span>
-            </div>
             {/* Step progress dots */}
             <div className="flex items-center gap-2">
               {steps.map((_, i) => (
@@ -759,7 +745,7 @@ export default function Home() {
           <div key={displayStep} className="step-in flex-1 flex flex-col">
             <div className="flex-1 flex flex-col justify-center px-16 gap-4" style={{ maxWidth: "55%" }}>
 
-              {/* Step label + status badge */}
+              {/* Step label + status badge + up next */}
               <div className="flex items-center gap-3 flex-wrap">
                 <span className="text-xs uppercase tracking-widest font-semibold" style={{ color: "#97BC62" }}>
                   Step {displayStep + 1} of {steps.length}
@@ -773,15 +759,6 @@ export default function Home() {
                     ✓ Step complete!
                   </span>
                 )}
-
-                {stepCheckData && !stepCompleted && (
-                  <span
-                    className="text-xs font-medium px-2.5 py-1 rounded-full"
-                    style={{ background: "#D4A01715", color: "#D4A017", border: "1.5px solid #D4A01740" }}
-                  >
-                    👁 Watching…
-                  </span>
-                )}
               </div>
 
               {/* Step title */}
@@ -790,84 +767,92 @@ export default function Home() {
               </h2>
 
               {/* Step how-to detail (loaded from /step/details) */}
-              {currentStepDetail && (
+              {currentStepDetail ? (
                 <p className="text-xl leading-relaxed" style={{ color: "#5a5a4a" }}>
                   {currentStepDetail}
                 </p>
+              ) : (
+                <div className="flex flex-col gap-2 mt-1">
+                  <Skeleton className="h-5 w-full rounded-lg" style={{ background: "#d5cdc4" }} />
+                  <Skeleton className="h-5 w-3/4 rounded-lg" style={{ background: "#d5cdc4" }} />
+                </div>
               )}
 
-              {/* Live AI vision analysis card */}
-              {stepCheckData ? (
-                <div
-                  className="rounded-2xl p-4 flex flex-col gap-3 mt-2"
-                  style={{
-                    background: stepCompleted ? "#2C5F2E12" : "#fff",
-                    border: `1.5px solid ${stepCompleted ? "#2C5F2E50" : "#e8e0d8"}`,
-                    boxShadow: "0 2px 12px #0000000a",
-                    transition: "border-color 0.4s ease, background 0.4s ease",
-                  }}
-                >
-                  {/* Card header */}
-                  <div className="flex items-center gap-2">
-                    <span className="ai-dot w-2 h-2 rounded-full shrink-0" style={{ background: stepCompleted ? "#2C5F2E" : "#D4A017" }} />
-                    <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: stepCompleted ? "#2C5F2E" : "#D4A017" }}>
-                      {stepCompleted ? "Step confirmed ✓" : "Live AI Analysis"}
-                    </span>
-                  </div>
+              {/* Live analysis + Goal image side by side */}
+              <div className="flex gap-3 mt-2" style={{ height: "240px" }}>
+                {/* Live AI vision analysis card — left */}
+                <div className="min-w-0" style={{ width: "240px", flexShrink: 0 }}>
+                  {stepCheckData ? (
+                    <div
+                      className="rounded-xl p-3 flex flex-col gap-2 h-full overflow-hidden"
+                      style={{
+                        background: stepCompleted ? "#2C5F2E12" : "#fff",
+                        border: `1.5px solid ${stepCompleted ? "#2C5F2E50" : "#e8e0d8"}`,
+                        boxShadow: "0 2px 12px #0000000a",
+                        transition: "border-color 0.4s ease, background 0.4s ease",
+                      }}
+                    >
+                      {/* Card header */}
+                      <div className="flex items-center gap-1.5 bg-neutral-50">
+                        <span className="ai-dot w-1.5 h-1.5 rounded-full shrink-0" style={{ background: stepCompleted ? "#97BC62" : "#97BC62" }} />
+                        <span className="text-[10px] font-semibold uppercase tracking-widest" style={{ color: stepCompleted ? "#97BC62" : "#97BC62" }}>
+                          {stepCompleted ? "Confirmed ✓" : "Live Analysis"}
+                        </span>
+                      </div>
 
-                  {/* State description — what the AI sees right now */}
-                  {stepCheckData.state?.explanation && (
-                    <p className="text-sm leading-relaxed" style={{ color: "#5a5a4a" }}>
-                      {stepCheckData.state.explanation}
-                    </p>
-                  )}
+                      {/* Action description */}
+                      {stepCheckData.action?.explanation && (
+                        <p className="text-xs leading-relaxed" style={{ color: "#5a5a4a" }}>
+                          {stepCheckData.action.explanation}
+                        </p>
+                      )}
 
-                  {/* Action description — what the AI says you should do / are doing */}
-                  {stepCheckData.action?.explanation &&
-                    stepCheckData.action.explanation !== stepCheckData.state?.explanation && (
-                    <div className="flex items-start gap-2 rounded-xl px-3 py-2" style={{ background: stepCompleted ? "#2C5F2E15" : "#D4A01712" }}>
-                      <span className="text-base shrink-0 mt-0.5">{stepCompleted ? "✅" : "👉"}</span>
-                      <p className="text-sm leading-relaxed font-medium" style={{ color: stepCompleted ? "#2C5F2E" : "#3a3a2a" }}>
-                        {stepCheckData.action.explanation}
-                      </p>
+                      {/* Subtle hint */}
+                      {stepCheckData.hint && (
+                        <p className="text-[9px] italic mt-auto" style={{ color: "#b0a898" }}>
+                          {stepCheckData.hint}
+                        </p>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="rounded-xl p-3 flex flex-col gap-3 h-full" style={{ border: "1.5px solid #e8e0d8" }}>
+                      <Skeleton className="h-3 w-24 rounded" style={{ background: "#d5cdc4" }} />
+                      <Skeleton className="h-3 w-full rounded" style={{ background: "#d5cdc4" }} />
+                      <Skeleton className="h-3 w-4/5 rounded" style={{ background: "#d5cdc4" }} />
+                      <Skeleton className="h-3 w-3/5 rounded" style={{ background: "#d5cdc4" }} />
                     </div>
                   )}
                 </div>
-              ) : (
-                <div
-                  className="rounded-2xl px-4 py-3 flex items-center gap-2 mt-2"
-                  style={{ background: "#f5f0ea", border: "1.5px solid #e8e0d8" }}
-                >
-                  <span className="ai-dot w-2 h-2 rounded-full shrink-0" style={{ background: "#97BC62" }} />
-                  <p className="text-sm" style={{ color: "#97BC62" }}>Starting AI analysis…</p>
+
+                {/* Goal image — right */}
+                <div className="min-w-0" style={{ width: "240px", flexShrink: 0 }}>
+                  {currentStepImage ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={currentStepImage}
+                      alt={`What "${currentStepLabel}" should look like`}
+                      className="w-full h-full object-cover rounded-xl"
+                    />
+                  ) : (
+                    <Skeleton className="w-full h-full rounded-xl" style={{ background: "#d5cdc4" }} />
+                  )}
                 </div>
-              )}
+              </div>
             </div>
 
             {/* Remy says — speech responses */}
-            <div className="mx-16 mb-6 rounded-2xl p-4 flex gap-3 items-start" style={{ background: "#2C5F2E15", border: "1px solid #2C5F2E30" }}>
-              <span className="text-xl mt-0.5">🐀</span>
-              <div className="flex flex-col gap-1 flex-1">
-                <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: "#2C5F2E" }}>Remy says</span>
-                <p className="text-sm leading-relaxed" style={{ color: "#3a3a2a" }}>
-                  {remySpeech || "Listening and watching… ask me anything about this step!"}
-                </p>
+            <div className="mx-16 mb-6 rounded-2xl p-4 flex flex-col gap-1" style={{ background: "#97BC6218", border: "1px solid #97BC6240" }}>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: "#97BC62" }}>Remy says...</span>
+                <div className="pb-1">
+                  <Waveform />
+                </div>
               </div>
-              <div className="ml-auto flex flex-col items-end gap-1.5 shrink-0 mt-1">
-                <Waveform />
-                <span className="text-xs" style={{ color: "#97BC62" }}>listening</span>
-              </div>
+              <p className="text-sm leading-relaxed" style={{ color: "#3a3a2a" }}>
+                {remySpeech || "Ask me anything about this step!"}
+              </p>
             </div>
 
-            {/* Up next */}
-            {displayStep < steps.length - 1 && (
-              <div className="px-16 pb-4 flex items-center gap-3">
-                <span className="text-xs uppercase tracking-widest font-medium shrink-0" style={{ color: "#97BC62" }}>Up next</span>
-                <span className="text-sm truncate" style={{ color: "#97BC62" }}>
-                  {steps[displayStep + 1]}
-                </span>
-              </div>
-            )}
           </div>
 
           {/* CTA button */}
@@ -875,7 +860,7 @@ export default function Home() {
             <button
               onClick={handleNext}
               disabled={animating}
-              className="w-full rounded-2xl py-4 text-lg font-semibold transition-all hover:brightness-110 active:scale-[0.98] disabled:opacity-50"
+              className="w-full rounded-2xl py-4 text-lg font-semibold transition-all duration-200 ease-out hover:brightness-110 hover:scale-[1.01] active:scale-[0.98] disabled:opacity-50"
               style={{
                 background: stepCompleted ? "#2C5F2E" : "#D4A017",
                 color: "#fff",
@@ -883,8 +868,8 @@ export default function Home() {
               }}
             >
               {currentStep < steps.length - 1
-                ? stepCompleted ? "✓  Step Done — Next →" : "Mark Done — Next →"
-                : stepCompleted ? "✓  Finish!" : "Mark Complete"}
+                ? stepCompleted ? "✓  Step Done — Next →" : "Next Step →"
+                : stepCompleted ? "✓  Finish!" : "Finish ✓"}
             </button>
           </div>
 
