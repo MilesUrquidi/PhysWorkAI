@@ -10,6 +10,8 @@ from pydantic import BaseModel
 from chatgpt import generate_task_steps
 from camera import get_camo_feed, set_current_step, results_queue, audio_running, get_latest_frame_jpeg, stop_pipeline
 from context_help import get_step_details, get_step_image
+from caution import get_safety_caution, get_allergens, get_recipe_allergens
+from onlinerecipe import steps_from_url, fetch_recipe
 
 app = FastAPI()
 
@@ -19,6 +21,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _is_url(s: str) -> bool:
+    return s.startswith("http://") or s.startswith("https://")
 
 # ---------------------------------------------------------------------------
 # Request models
@@ -33,6 +42,10 @@ class StepRequest(BaseModel):
 class StartRequest(BaseModel):
     system_prompt: str | None = None
     camera_index: int | None = None
+
+class SafeRecipeRequest(BaseModel):
+    food: str
+    avoid: list[str] = []
 
 # ---------------------------------------------------------------------------
 # State
@@ -54,8 +67,33 @@ SYSTEM_PROMPT_DEFAULT = (
 
 @app.post("/recipe/generate")
 def generate(req: FoodRequest):
-    """Generate ordered recipe steps for a given food."""
-    steps = generate_task_steps(req.food)
+    """Generate ordered recipe steps for a given food or recipe URL."""
+    if _is_url(req.food):
+        steps = steps_from_url(req.food)
+    else:
+        steps = generate_task_steps(req.food)
+    return {"steps": steps}
+
+
+@app.post("/recipe/allergens")
+def recipe_allergens(req: FoodRequest):
+    """Scan the whole recipe for all potentially allergenic ingredients."""
+    if _is_url(req.food):
+        # Fetch the real ingredient list from the page for accurate allergen scanning
+        recipe_text = fetch_recipe(req.food)
+        allergens = get_recipe_allergens(recipe_text)
+    else:
+        allergens = get_recipe_allergens(req.food)
+    return {"allergens": allergens}
+
+
+@app.post("/recipe/generate-safe")
+def generate_safe(req: SafeRecipeRequest):
+    """Generate recipe steps with allergen substitutions."""
+    if _is_url(req.food):
+        steps = steps_from_url(req.food, avoid=req.avoid or None)
+    else:
+        steps = generate_task_steps(req.food, avoid=req.avoid or None)
     return {"steps": steps}
 
 
@@ -141,6 +179,22 @@ def step_details(step: str):
 def step_image(step: str, recipe: str | None = None):
     """Return an image URL showing the completed state of a recipe step."""
     return get_step_image(step, recipe=recipe)
+
+
+@app.get("/step/safety")
+def step_safety(step: str):
+    """Return a safety caution + tip for a recipe step, or null values if none."""
+    data = get_safety_caution(step)
+    if data is None:
+        return {"caution": None, "tip": None}
+    return {"caution": data.get("caution"), "tip": data.get("tip")}
+
+
+@app.get("/step/allergens")
+def step_allergens(step: str):
+    """Return a list of allergens detected in a recipe step, or null if none."""
+    allergens = get_allergens(step)
+    return {"allergens": allergens}
 
 # ---------------------------------------------------------------------------
 # SSE stream  —  frontend subscribes here to get live AI results

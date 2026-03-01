@@ -153,6 +153,8 @@ Rules for every step:
 - Written as one short imperative sentence (max 10 words)
 - No time-based instructions ("wait 2 minutes") — visible state only
 - Cover the full recipe from start to finish
+- If a step requires a specific kitchen tool (knife, peeler, grater, pan, etc.), name it explicitly in the step (e.g. "cut apple into slices using a knife")
+- Include an approximate single-serving measurement for every ingredient the first time it appears in a step (e.g. "2 tbsp of peanut butter", "1 cup of milk", "3g of matcha powder"). Assume the recipe makes exactly one portion.
 
 Return ONLY a raw JSON array of strings. No markdown, no explanation, no extra keys."""
 
@@ -163,7 +165,7 @@ _TASK_DECOMP_EXAMPLES = [
     },
     {
         "role": "assistant",
-        "content": '["Two slices of bread are laid flat on a surface", "Peanut butter is spread across one slice", "Jelly is spread across the other slice", "Both slices are pressed together face-down"]'
+        "content": '["Two slices of bread are laid flat on a surface", "2 tbsp of peanut butter is spread across one slice using a butter knife", "1½ tbsp of jelly is spread across the other slice using a butter knife", "Both slices are pressed together face-down"]'
     },
     {
         "role": "user",
@@ -171,7 +173,7 @@ _TASK_DECOMP_EXAMPLES = [
     },
     {
         "role": "assistant",
-        "content": '["A glass is placed on a flat surface", "Glass is filled with ice cubes", "Coffee is poured over the ice", "Milk or creamer is added to the glass", "Drink is stirred with a spoon"]'
+        "content": '["A glass is placed on a flat surface", "½ cup of ice cubes is added to the glass", "180ml of brewed coffee is poured over the ice", "2 tbsp of milk or creamer is added to the glass", "Drink is stirred with a spoon"]'
     },
     {
         "role": "user",
@@ -179,7 +181,7 @@ _TASK_DECOMP_EXAMPLES = [
     },
     {
         "role": "assistant",
-        "content": '["A bowl is placed on a flat surface", "Cereal is poured into the bowl", "Milk is poured over the cereal"]'
+        "content": '["A bowl is placed on a flat surface", "1 cup of cereal is poured into the bowl", "½ cup of milk is poured over the cereal"]'
     },
     {
         "role": "user",
@@ -187,12 +189,12 @@ _TASK_DECOMP_EXAMPLES = [
     },
     {
         "role": "assistant",
-        "content": '["A slice of bread is placed on a flat surface", "Bread is toasted and placed back on the surface", "Avocado is scooped and spread across the toast", "Salt and pepper are sprinkled on top"]'
+        "content": '["A slice of bread is placed on a flat surface", "Bread is toasted and placed back on the surface", "½ an avocado is halved using a knife", "Avocado flesh is scooped and spread across the toast using a butter knife", "A pinch of salt and pepper are sprinkled on top"]'
     },
 ]
 
 
-def generate_task_steps(task: str) -> list[str]:
+def generate_task_steps(task: str, avoid: list[str] | None = None) -> list[str]:
     """
     Break a physical task into a list of frame-verifiable steps using GPT.
 
@@ -207,7 +209,10 @@ def generate_task_steps(task: str) -> list[str]:
 
     messages = [{"role": "system", "content": _TASK_DECOMP_SYSTEM}]
     messages.extend(_TASK_DECOMP_EXAMPLES)
-    messages.append({"role": "user", "content": f"Task: {task}"})
+    user_content = f"Task: {task}"
+    if avoid:
+        user_content += f"\nSubstitute these allergens with safe alternatives: {', '.join(avoid)}"
+    messages.append({"role": "user", "content": user_content})
 
     response = client.chat.completions.create(
         model="gpt-4o",
