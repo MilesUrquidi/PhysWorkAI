@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import { Separator } from "@/components/ui/separator";
 
 // Palette
 // #2C5F2E — deep forest green (primary)
@@ -111,8 +112,9 @@ export default function Home() {
         const msg = JSON.parse(event.data);
 
         if (msg.type === "step_check") {
-          // Ignore stale results from a previous step
-          if (msg.step && msg.step !== currentStepLabelRef.current) return;
+          // Ignore stale results — require step label to match current step.
+          // If msg.step is null/undefined (queued before set-step was called), discard it.
+          if (!msg.step || msg.step !== currentStepLabelRef.current) return;
 
           // Backend strips markdown fences before sending, but handle
           // string fallback here too in case GPT slips through anyway.
@@ -126,7 +128,7 @@ export default function Home() {
           }
           if (data && typeof data === "object") {
             setStepCheckData(data as StepCheckData);
-            if (data.completed) setStepCompleted(true);
+            if (data.completed === true) setStepCompleted(true);
           }
         } else if (msg.type === "speech") {
           const text = (msg.data as string).trim();
@@ -316,20 +318,11 @@ export default function Home() {
           .spinner { animation: spin 0.8s linear infinite; }
         `}</style>
 
-        <div className="flex-1 flex flex-col items-center justify-center gap-7 px-12">
+        <div className="flex-1 flex flex-col items-center justify-center gap-7 px-12 mb-20">
 
-          {/* Brand */}
+          {/* Heading */}
           <div className="w-full max-w-lg flex flex-col items-center gap-2 text-center">
-            <div className="flex items-center gap-3 mb-1">
-              <span className="text-5xl">🐀</span>
-              <span className="text-6xl font-bold tracking-tight" style={{ color: "#2C5F2E" }}>Remy</span>
-            </div>
-            <p className="text-base font-medium" style={{ color: "#97BC62" }}>your AI sous chef</p>
-            <div className="w-12 h-0.5 rounded-full my-2" style={{ background: "#D4A017" }} />
             <h1 className="text-2xl font-semibold" style={{ color: "#3a3a2a" }}>What are we cooking?</h1>
-            <p className="text-sm" style={{ color: "#97BC62" }}>
-              Tell Remy what you want to make — he'll guide you through it hands-free.
-            </p>
           </div>
 
           {/* Error banner */}
@@ -348,7 +341,7 @@ export default function Home() {
                 className="flex-1 rounded-xl py-2 text-sm font-semibold transition-all"
                 style={{
                   background: inputMode === mode ? "#fff" : "transparent",
-                  color: inputMode === mode ? "#2C5F2E" : "#97BC62",
+                  color: inputMode === mode ? "#3a3a2a" : "#3a3a2a",
                   boxShadow: inputMode === mode ? "0 1px 4px #0001" : "none",
                 }}
               >
@@ -362,8 +355,8 @@ export default function Home() {
             {inputMode === "describe" ? (
               <textarea
                 autoFocus
-                className="w-full text-base rounded-2xl px-4 py-3 resize-none outline-none leading-relaxed h-36 focus:ring-2"
-                style={{ background: "#fff", color: "#3a3a2a", border: "1.5px solid #97BC62", caretColor: "#D4A017" }}
+                className="w-full text-base rounded-2xl px-4 py-3 resize-none outline-none leading-relaxed h-36"
+                style={{ background: "#fff", color: "#3a3a2a", border: "2px solid #97BC62", caretColor: "#D4A017" }}
                 placeholder="e.g. Spaghetti carbonara, chocolate chip cookies, chicken stir fry…"
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
@@ -373,9 +366,9 @@ export default function Home() {
               <div className="flex flex-col gap-3">
                 <div
                   className="flex items-center gap-3 rounded-2xl px-4 py-3"
-                  style={{ background: "#fff", border: `1.5px solid ${urlParsed ? "#2C5F2E" : "#97BC62"}` }}
+                  style={{ background: "#fff", border: `2px solid ${urlParsed ? "#2C5F2E" : "#97BC62"}` }}
                 >
-                  <svg className="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="#97BC62" strokeWidth={1.5}>
+                  <svg className="w-7 h-7 shrink-0 pb-1" fill="none" viewBox="0 0 30 30" stroke="#97BC62" strokeWidth={1.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101" />
                     <path strokeLinecap="round" strokeLinejoin="round" d="M10.172 13.828a4 4 0 015.656 0l4 4a4 4 0 01-5.656 5.656l-1.102-1.101" />
                   </svg>
