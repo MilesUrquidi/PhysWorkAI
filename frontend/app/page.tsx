@@ -74,6 +74,8 @@ export default function Home() {
   const handleNextRef = useRef<() => Promise<void>>(async () => {});
   const currentStepLabelRef = useRef<string>("");
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  // True while Remy is reading a step aloud — suppresses overlapping speech events
+  const stepSpeakingRef = useRef<boolean>(false);
 
   // Cleanup SSE and audio on unmount
   useEffect(() => {
@@ -110,7 +112,7 @@ export default function Home() {
 
   // ── TTS playback — stop-and-replace on new speech ──────────────
 
-  async function speak(text: string) {
+  async function speak(text: string, isStepAnnouncement = false) {
     // Stop whatever is currently playing immediately
     if (audioRef.current) {
       audioRef.current.pause();
@@ -118,22 +120,31 @@ export default function Home() {
       audioRef.current = null;
     }
 
+    if (isStepAnnouncement) stepSpeakingRef.current = true;
+
     try {
       const res = await fetch(`${BACKEND_URL}/tts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text, voice: "fable" }),
       });
-      if (!res.ok) return;
+      if (!res.ok) {
+        if (isStepAnnouncement) stepSpeakingRef.current = false;
+        return;
+      }
 
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       audioRef.current = audio;
       audio.play();
-      audio.onended = () => URL.revokeObjectURL(url);
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        if (isStepAnnouncement) stepSpeakingRef.current = false;
+      };
     } catch {
       // TTS failure is non-fatal — text is still displayed
+      if (isStepAnnouncement) stepSpeakingRef.current = false;
     }
   }
 
@@ -171,7 +182,8 @@ export default function Home() {
           // Ignore JSON responses — these are step-check bleed from false VAD triggers
           if (!text.startsWith("{") && !text.startsWith("```")) {
             setRemySpeech(text);
-            speak(text);
+            // Don't interrupt Remy reading the step aloud
+            if (!stepSpeakingRef.current) speak(text);
           }
         }
       } catch {
@@ -188,16 +200,26 @@ export default function Home() {
 
   // ── Step details (optional, background fetch) ──────────────────
 
-  async function loadStepDetails(step: string) {
+  async function loadStepDetails(step: string): Promise<string | null> {
     try {
       const res = await fetch(`${BACKEND_URL}/step/details?step=${encodeURIComponent(step)}`);
       const data = await res.json();
       if (data.details) {
         setStepDetails(prev => ({ ...prev, [step]: data.details }));
+        return data.details as string;
       }
     } catch {
       // optional — fine to fail silently
     }
+    return null;
+  }
+
+  // ── Announce a step — reads title + detail aloud together ──────
+
+  async function announceStep(step: string) {
+    const detail = await loadStepDetails(step);
+    const text = detail ? `${step}. ${detail}` : step;
+    speak(text, true);
   }
 
   // ── Navigation helpers ─────────────────────────────────────────
@@ -283,8 +305,8 @@ export default function Home() {
       setCameraActive(true);
       crossFadeTo("coaching");
 
-      // 5. Load first step details in background
-      loadStepDetails(newSteps[0]);
+      // 5. Load first step details then read aloud
+      announceStep(newSteps[0]);
 
     } catch (err) {
       clearInterval(interval);
@@ -340,7 +362,8 @@ export default function Home() {
     setTimeout(() => {
       setDisplayStep(nextIdx);
       setAnimating(false);
-      loadStepDetails(steps[nextIdx]);
+      // Load details then read step + detail aloud together
+      announceStep(steps[nextIdx]);
     }, 400);
   }
 
