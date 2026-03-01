@@ -2,6 +2,10 @@
 
 import { useState, useEffect, useRef } from "react";
 import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
 
 // Palette
 // #2C5F2E — deep forest green (primary)
@@ -31,6 +35,7 @@ const LOADING_MESSAGES = [
   "Preheating the oven…",
   "Tasting the sauce…",
   "Getting ready to cook…",
+  "Swapping ingredients…",
 ];
 
 function isValidUrl(str: string) {
@@ -47,7 +52,7 @@ function isValidUrl(str: string) {
 // ---------------------------------------------------------------------------
 
 export default function Home() {
-  const [phase, setPhase] = useState<"prompt" | "loading" | "coaching">("prompt");
+  const [phase, setPhase] = useState<"prompt" | "loading" | "allergens" | "coaching">("prompt");
   const [inputMode, setInputMode] = useState<"describe" | "url">("describe");
   const [prompt, setPrompt] = useState("");
   const [recipeUrl, setRecipeUrl] = useState("");
@@ -68,6 +73,8 @@ export default function Home() {
   const [apiError, setApiError] = useState<string | null>(null);
   const [cameraActive, setCameraActive] = useState(false);
   const [showCompletionOverlay, setShowCompletionOverlay] = useState(false);
+  const [detectedAllergens, setDetectedAllergens] = useState<string[]>([]);
+  const [selectedAllergens, setSelectedAllergens] = useState<string[]>([]);
 
   const eventSourceRef = useRef<EventSource | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -178,9 +185,34 @@ export default function Home() {
     }
   }
 
+  // ── Start camera + SSE + go to coaching ───────────────────────
+
+  async function startCooking(stepsToUse: string[]) {
+    await fetch(`${BACKEND_URL}/camera/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    await fetch(`${BACKEND_URL}/recipe/set-step`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ step: stepsToUse[0] }),
+    });
+    connectSSE();
+    setCurrentStep(0);
+    setDisplayStep(0);
+    setStepCompleted(false);
+    setStepCheckData(null);
+    setRemySpeech("");
+    setCameraActive(true);
+    crossFadeTo("coaching");
+    loadStepDetails(stepsToUse[0]);
+    loadStepCaution(stepsToUse[0]);
+  }
+
   // ── Navigation helpers ─────────────────────────────────────────
 
-  function crossFadeTo(nextPhase: "prompt" | "loading" | "coaching") {
+  function crossFadeTo(nextPhase: "prompt" | "loading" | "allergens" | "coaching") {
     setPhase(nextPhase);
   }
 
@@ -221,46 +253,37 @@ export default function Home() {
     try {
       const food = inputMode === "describe" ? prompt.trim() : recipeUrl.trim();
 
-      // 1. Generate recipe steps
-      const genRes = await fetch(`${BACKEND_URL}/recipe/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ food }),
-      });
+      // 1. Generate steps + scan allergens in parallel
+      const [genRes, allergenRes] = await Promise.all([
+        fetch(`${BACKEND_URL}/recipe/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ food }),
+        }),
+        fetch(`${BACKEND_URL}/recipe/allergens`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ food }),
+        }),
+      ]);
+
       if (!genRes.ok) throw new Error(`Recipe generation failed (${genRes.status})`);
       const genData = await genRes.json();
       const newSteps: string[] = genData.steps;
       setSteps(newSteps);
-
-      // 2. Start camera + AI pipeline
-      await fetch(`${BACKEND_URL}/camera/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-
-      // 3. Set first step
-      await fetch(`${BACKEND_URL}/recipe/set-step`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ step: newSteps[0] }),
-      });
-
-      // 4. Open SSE stream
-      connectSSE();
-
       clearInterval(interval);
-      setCurrentStep(0);
-      setDisplayStep(0);
-      setStepCompleted(false);
-      setStepCheckData(null);
-      setRemySpeech("");
-      setCameraActive(true);
-      crossFadeTo("coaching");
 
-      // 5. Load first step details + caution in background
-      loadStepDetails(newSteps[0]);
-      loadStepCaution(newSteps[0]);
+      // 2. If allergens found, pause and ask user before starting camera
+      const allergenData = allergenRes.ok ? await allergenRes.json() : { allergens: null };
+      if (allergenData.allergens && allergenData.allergens.length > 0) {
+        setDetectedAllergens(allergenData.allergens);
+        setSelectedAllergens([]);
+        crossFadeTo("allergens");
+        return;
+      }
+
+      // 3. No allergens — go straight to cooking
+      await startCooking(newSteps);
 
     } catch (err) {
       clearInterval(interval);
@@ -268,6 +291,34 @@ export default function Home() {
       setApiError(`${msg} — is the backend running on port 8000?`);
       crossFadeTo("prompt");
     }
+  }
+
+  // ── Allergen continue ──────────────────────────────────────────
+
+  async function handleAllergenContinue() {
+    let stepsToUse = steps;
+
+    if (selectedAllergens.length > 0) {
+      crossFadeTo("loading");
+      setLoadingMsg("Swapping ingredients…");
+      try {
+        const food = inputMode === "describe" ? prompt.trim() : recipeUrl.trim();
+        const res = await fetch(`${BACKEND_URL}/recipe/generate-safe`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ food, avoid: selectedAllergens }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          stepsToUse = data.steps;
+          setSteps(stepsToUse);
+        }
+      } catch {
+        // Fall back to original steps if substitution fails
+      }
+    }
+
+    await startCooking(stepsToUse);
   }
 
   // ── End recipe early and return to home ───────────────────────
@@ -281,6 +332,7 @@ export default function Home() {
     setCurrentStep(0); setDisplayStep(0); setDone(false);
     setSteps([]); setStepDetails({}); setRemySpeech("");
     setStepCompleted(false); setStepCheckData(null);
+    setDetectedAllergens([]); setSelectedAllergens([]);
     crossFadeTo("prompt");
   }
 
@@ -480,6 +532,97 @@ export default function Home() {
     );
   }
 
+  // ── ALLERGEN SCREEN ────────────────────────────────────────────
+
+  if (phase === "allergens") {
+    return (
+      <div className="relative flex h-screen w-screen overflow-hidden" style={{ background: "#FFF8F0" }}>
+        <div className="flex-1 flex flex-col items-center justify-center gap-6 px-12 overflow-y-auto py-10">
+
+          {/* Brand */}
+          <div className="w-full max-w-lg flex flex-col items-center gap-2 text-center">
+            <div className="flex items-center gap-3 mb-1">
+              <span className="text-4xl">🐀</span>
+              <span className="text-5xl font-bold tracking-tight" style={{ color: "#2C5F2E" }}>Remy</span>
+            </div>
+            <div className="w-12 h-0.5 rounded-full my-2" style={{ background: "#D4A017" }} />
+            <h1 className="text-2xl font-semibold" style={{ color: "#3a3a2a" }}>Any allergies?</h1>
+            <p className="text-sm" style={{ color: "#97BC62" }}>
+              We found these in your recipe. Check any you&apos;re allergic to — Remy will swap them out.
+            </p>
+          </div>
+
+          {/* Allergen toggle cards */}
+          <div className="w-full max-w-lg grid grid-cols-2 gap-3">
+            {detectedAllergens.map(allergen => {
+              const checked = selectedAllergens.includes(allergen);
+              return (
+                <Card
+                  key={allergen}
+                  onClick={() => setSelectedAllergens(prev =>
+                    checked ? prev.filter(a => a !== allergen) : [...prev, allergen]
+                  )}
+                  className={cn(
+                    "cursor-pointer transition-all hover:brightness-95 active:scale-[0.98] py-0 shadow-none",
+                    checked ? "border-[#2C5F2E] bg-[#2C5F2E]/[0.06]" : "border-[#e8e0d8]"
+                  )}
+                >
+                  <CardContent className="flex items-center gap-3 px-4 py-3">
+                    <span className="text-xl">{allergenEmoji(allergen)}</span>
+                    <span className="text-sm font-medium capitalize flex-1" style={{ color: "#3a3a2a" }}>{allergen}</span>
+                    {checked && (
+                      <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="#2C5F2E" strokeWidth={2.5}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                      </svg>
+                    )}
+                  </CardContent>
+                </Card>
+              );
+            })}
+          </div>
+
+          {/* Selected badges summary */}
+          {selectedAllergens.length > 0 && (
+            <div className="w-full max-w-lg flex flex-wrap gap-2">
+              {selectedAllergens.map(a => (
+                <Badge key={a} variant="outline" className="capitalize rounded-full px-3 py-1 text-xs font-medium"
+                  style={{ borderColor: "#2C5F2E50", color: "#2C5F2E", background: "#2C5F2E10" }}>
+                  {allergenEmoji(a)} {a}
+                </Badge>
+              ))}
+            </div>
+          )}
+
+          {/* CTA buttons */}
+          <div className="w-full max-w-lg flex flex-col gap-3">
+            {selectedAllergens.length > 0 && (
+              <Button
+                onClick={handleAllergenContinue}
+                className="w-full rounded-2xl h-12 text-base font-semibold hover:opacity-90"
+                style={{ background: "#2C5F2E", color: "#fff" }}
+              >
+                Adapt recipe &amp; Continue →
+              </Button>
+            )}
+            <Button
+              variant="outline"
+              onClick={handleAllergenContinue}
+              className="w-full rounded-2xl h-12 text-base font-semibold"
+              style={
+                selectedAllergens.length > 0
+                  ? { color: "#97BC62", borderColor: "#e8e0d8" }
+                  : { background: "#D4A017", color: "#fff", border: "none" }
+              }
+            >
+              {selectedAllergens.length > 0 ? "No thanks — Let\u2019s Cook!" : "No changes — Let\u2019s Cook! \u2192"}
+            </Button>
+          </div>
+
+        </div>
+      </div>
+    );
+  }
+
   // ── COMPLETION SCREEN ──────────────────────────────────────────
 
   if (done) {
@@ -503,6 +646,7 @@ export default function Home() {
               setCurrentStep(0); setDisplayStep(0); setDone(false);
               setSteps([]); setStepDetails({}); setRemySpeech("");
               setStepCompleted(false); setStepCheckData(null);
+              setDetectedAllergens([]); setSelectedAllergens([]);
               setCameraActive(false);
               crossFadeTo("prompt");
             }}
@@ -748,6 +892,36 @@ export default function Home() {
       </div>
     </>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Allergen emoji helper
+// ---------------------------------------------------------------------------
+
+function allergenEmoji(name: string): string {
+  const n = name.toLowerCase();
+  if (n.includes("peanut")) return "🥜";
+  if (n.includes("tree nut") || n.includes("walnut") || n.includes("almond") || n.includes("cashew") || n.includes("pecan") || n.includes("pistachio") || n.includes("hazelnut")) return "🌰";
+  if (n.includes("cheese")) return "🧀";
+  if (n.includes("butter") && !n.includes("peanut")) return "🧈";
+  if (n.includes("dairy") || n.includes("milk") || n.includes("cream")) return "🥛";
+  if (n.includes("egg")) return "🥚";
+  if (n.includes("gluten") || n.includes("wheat") || n.includes("flour") || n.includes("bread")) return "🌾";
+  if (n.includes("soy")) return "🫘";
+  if (n.includes("shrimp") || n.includes("prawn") || n.includes("shellfish")) return "🦐";
+  if (n.includes("crab")) return "🦀";
+  if (n.includes("lobster")) return "🦞";
+  if (n.includes("oyster") || n.includes("mussel") || n.includes("clam") || n.includes("scallop")) return "🦪";
+  if (n.includes("fish") || n.includes("salmon") || n.includes("tuna") || n.includes("cod")) return "🐟";
+  if (n.includes("sesame")) return "🌱";
+  if (n.includes("kiwi")) return "🥝";
+  if (n.includes("strawberry")) return "🍓";
+  if (n.includes("avocado")) return "🥑";
+  if (n.includes("mango")) return "🥭";
+  if (n.includes("mustard")) return "🌿";
+  if (n.includes("celery")) return "🥬";
+  if (n.includes("cinnamon") || n.includes("spice")) return "🫙";
+  return "⚠️";
 }
 
 // ---------------------------------------------------------------------------

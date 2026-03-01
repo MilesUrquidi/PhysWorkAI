@@ -203,7 +203,10 @@ def set_current_step(step: str):
         f'- completed is true if state.completed OR action.completed is true\n'
         f'- Be strict: only mark completed true if you are clearly sure\n'
         f'- Keep explanations to one short sentence each\n'
-        f'- Return raw JSON only, no markdown code blocks'
+        f'- Return raw JSON only, no markdown code blocks\n'
+        f'- Accept functional equivalents for containers and tools: a mason jar, mug, bowl, or any similar vessel used in place of a cup or measuring cup is acceptable — judge by the visible end state, not the exact equipment\n'
+        f'- Treat measurements as approximate: do not fail a step because an amount looks slightly more or less than specified — focus on whether the visible result is roughly correct\n'
+        f'- If the step names a specific tool (e.g. "butter knife", "cup") but the user achieves the same visible outcome with a different one, still mark it completed'
     )
 
 
