@@ -73,6 +73,7 @@ def get_allergens(step: str) -> list[str] | None:
     try:
         cleaned = result.replace("```json", "").replace("```", "").strip()
         allergens = json.loads(cleaned)
+        allergens = [a for a in allergens if a.strip().lower() not in ("none", "n/a", "na", "")]
         return allergens if allergens else None
     except Exception:
         return None
@@ -111,6 +112,7 @@ def get_recipe_allergens(food: str) -> list[str] | None:
     try:
         cleaned = result.replace("```json", "").replace("```", "").strip()
         allergens = json.loads(cleaned)
+        allergens = [a for a in allergens if a.strip().lower() not in ("none", "n/a", "na", "")]
         return allergens if allergens else None
     except Exception:
         return None

@@ -7,6 +7,7 @@
 body {
   background: #FFF8F0;
   color: #3a3a2a;
+  font-family: var(--font-lora), serif;
 }
 
 @theme inline {
