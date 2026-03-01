@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from chatgpt import generate_task_steps
-from camera import get_camo_feed, set_current_step, results_queue, audio_running
+from camera import get_camo_feed, set_current_step, results_queue, audio_running, get_latest_frame_jpeg, stop_pipeline
 from context_help import get_step_details, get_step_image
 
 app = FastAPI()
@@ -32,6 +32,7 @@ class StepRequest(BaseModel):
 
 class StartRequest(BaseModel):
     system_prompt: str | None = None
+    camera_index: int | None = None
 
 # ---------------------------------------------------------------------------
 # State
@@ -73,13 +74,21 @@ def start_camera(req: StartRequest):
     """Start the camera feed + AI pipeline in a background thread."""
     global _camera_thread
 
+    # If a previous run is still winding down, stop it and wait up to 3 s
     if _camera_thread and _camera_thread.is_alive():
-        return {"ok": False, "message": "Camera already running"}
+        stop_pipeline()
+        _camera_thread.join(timeout=3.0)
+        if _camera_thread.is_alive():
+            return {"ok": False, "message": "Camera still shutting down — try again in a moment"}
+
+    # Set audio_running BEFORE returning so the /camera/feed generator
+    # is already live when the frontend renders the <img> tag.
+    audio_running.set()
 
     prompt = req.system_prompt or SYSTEM_PROMPT_DEFAULT
     _camera_thread = threading.Thread(
         target=get_camo_feed,
-        kwargs={"system_prompt": prompt},
+        kwargs={"system_prompt": prompt, "camera_index": req.camera_index},
         daemon=True,
     )
     _camera_thread.start()
@@ -88,9 +97,35 @@ def start_camera(req: StartRequest):
 
 @app.post("/camera/stop")
 def stop_camera():
-    """Stop the camera feed and AI pipeline."""
-    audio_running.clear()
+    """Stop the camera feed and AI pipeline, flushing all queues immediately."""
+    stop_pipeline()
     return {"ok": True}
+
+
+@app.get("/camera/feed")
+async def camera_feed():
+    """
+    MJPEG stream of the live camera frames.
+    Connect with:  <img src="http://localhost:8000/camera/feed" />
+    """
+    async def generate():
+        # Loop only while the camera pipeline is active.
+        # When stop_pipeline() clears audio_running this generator exits cleanly,
+        # preventing zombie async tasks from accumulating across recipe runs.
+        while audio_running.is_set():
+            jpeg = get_latest_frame_jpeg(quality=70)
+            if jpeg is not None:
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+                )
+            await asyncio.sleep(0.04)  # ~25 fps cap
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 # ---------------------------------------------------------------------------
 # Step context
@@ -143,7 +178,15 @@ async def stream():
             except Exception:
                 await asyncio.sleep(0.1)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "Connection":        "keep-alive",
+            "X-Accel-Buffering": "no",   # disable nginx buffering if behind a proxy
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

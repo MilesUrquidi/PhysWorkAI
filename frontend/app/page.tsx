@@ -65,13 +65,34 @@ export default function Home() {
   const [stepCompleted, setStepCompleted] = useState(false);
   const [stepCheckData, setStepCheckData] = useState<StepCheckData | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
+  const [cameraActive, setCameraActive] = useState(false);
+  const [showCompletionOverlay, setShowCompletionOverlay] = useState(false);
 
   const eventSourceRef = useRef<EventSource | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handleNextRef = useRef<() => Promise<void>>(async () => {});
 
   // Cleanup SSE on unmount
   useEffect(() => {
     return () => { eventSourceRef.current?.close(); };
   }, []);
+
+  // Keep handleNextRef pointing at the latest handleNext closure
+  useEffect(() => {
+    handleNextRef.current = handleNext;
+  });
+
+  // Auto-advance when the AI confirms the step is complete
+  useEffect(() => {
+    if (!stepCompleted) return;
+    setShowCompletionOverlay(true);
+    const timer = setTimeout(() => {
+      setShowCompletionOverlay(false);
+      handleNextRef.current();
+    }, 1500);
+    return () => clearTimeout(timer);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stepCompleted]);
 
   // ── SSE connection ─────────────────────────────────────────────
 
@@ -84,7 +105,16 @@ export default function Home() {
         const msg = JSON.parse(event.data);
 
         if (msg.type === "step_check") {
-          const data = msg.data;
+          // Backend strips markdown fences before sending, but handle
+          // string fallback here too in case GPT slips through anyway.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          let data: any = msg.data;
+          if (typeof data === "string") {
+            try {
+              const stripped = data.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/,"").trim();
+              data = JSON.parse(stripped);
+            } catch { data = null; }
+          }
           if (data && typeof data === "object") {
             setStepCheckData(data as StepCheckData);
             if (data.completed) setStepCompleted(true);
@@ -195,6 +225,7 @@ export default function Home() {
       setStepCompleted(false);
       setStepCheckData(null);
       setRemySpeech("");
+      setCameraActive(true);
       crossFadeTo("coaching");
 
       // 5. Load first step details in background
@@ -208,14 +239,30 @@ export default function Home() {
     }
   }
 
+  // ── End recipe early and return to home ───────────────────────
+
+  async function handleEndRecipe() {
+    eventSourceRef.current?.close();
+    setCameraActive(false);
+    setShowCompletionOverlay(false);
+    try { await fetch(`${BACKEND_URL}/camera/stop`, { method: "POST" }); } catch {}
+    setPrompt(""); setRecipeUrl(""); setUrlParsed(false);
+    setCurrentStep(0); setDisplayStep(0); setDone(false);
+    setSteps([]); setStepDetails({}); setRemySpeech("");
+    setStepCompleted(false); setStepCheckData(null);
+    crossFadeTo("prompt");
+  }
+
   // ── Advance step ───────────────────────────────────────────────
 
   async function handleNext() {
     if (animating) return;
+    setShowCompletionOverlay(false);
     const nextIdx = currentStep + 1;
 
     if (nextIdx >= steps.length) {
       eventSourceRef.current?.close();
+      setCameraActive(false);
       try { await fetch(`${BACKEND_URL}/camera/stop`, { method: "POST" }); } catch {}
       setDone(true);
       return;
@@ -255,8 +302,6 @@ export default function Home() {
           @keyframes spin { to { transform: rotate(360deg); } }
           .spinner { animation: spin 0.8s linear infinite; }
         `}</style>
-
-        <CameraPip />
 
         <div className="flex-1 flex flex-col items-center justify-center gap-7 px-12">
 
@@ -387,7 +432,6 @@ export default function Home() {
           }
           .loading-msg { animation: msgFade 0.8s ease forwards; }
         `}</style>
-        <CameraPip />
         <div className="flex-1 flex flex-col items-center justify-center gap-8">
           <span className="text-7xl" style={{ filter: "drop-shadow(0 4px 12px #2C5F2E44)" }}>🐀</span>
           <div className="flex flex-col items-center gap-3">
@@ -416,7 +460,6 @@ export default function Home() {
             100% { opacity: 1; transform: scale(1) rotate(0deg); }
           }
         `}</style>
-        <CameraPip />
         <div className="flex-1 flex flex-col items-center justify-center gap-6 px-12">
           <div style={{ animation: "popIn 0.6s cubic-bezier(.34,1.56,.64,1) forwards" }} className="text-7xl">🍽️</div>
           <h2 className="text-4xl font-bold text-center" style={{ color: "#2C5F2E" }}>Bon appétit!</h2>
@@ -428,6 +471,7 @@ export default function Home() {
               setCurrentStep(0); setDisplayStep(0); setDone(false);
               setSteps([]); setStepDetails({}); setRemySpeech("");
               setStepCompleted(false); setStepCheckData(null);
+              setCameraActive(false);
               crossFadeTo("prompt");
             }}
             className="mt-4 rounded-2xl px-8 py-3 text-sm font-medium transition-all hover:brightness-110"
@@ -459,10 +503,57 @@ export default function Home() {
           50%       { box-shadow: 0 0 0 6px #2C5F2E00; }
         }
         .completed-badge { animation: completedPulse 1.8s ease-in-out infinite; }
+        @keyframes checkPop {
+          0%   { opacity: 0; transform: scale(0.4); }
+          65%  { transform: scale(1.12); }
+          100% { opacity: 1; transform: scale(1); }
+        }
+        @keyframes overlayFadeIn {
+          from { opacity: 0; }
+          to   { opacity: 1; }
+        }
+        .check-pop { animation: checkPop 0.5s cubic-bezier(.34,1.56,.64,1) forwards; }
+        .overlay-fade { animation: overlayFadeIn 0.25s ease forwards; }
+        @keyframes aiPulse {
+          0%, 100% { opacity: 1; }
+          50%       { opacity: 0.4; }
+        }
+        .ai-dot { animation: aiPulse 1.4s ease-in-out infinite; }
       `}</style>
 
+      {/* Step completion overlay */}
+      {showCompletionOverlay && (
+        <div
+          className="overlay-fade fixed inset-0 z-50 flex flex-col items-center justify-center gap-6"
+          style={{ background: "#2C5F2Edc", backdropFilter: "blur(6px)" }}
+        >
+          <div className="check-pop flex flex-col items-center gap-5">
+            {/* Circle + checkmark */}
+            <div
+              className="w-36 h-36 rounded-full flex items-center justify-center"
+              style={{ background: "#ffffff22", border: "3px solid #ffffffaa", boxShadow: "0 0 60px #ffffff33" }}
+            >
+              <svg className="w-20 h-20" fill="none" viewBox="0 0 24 24" stroke="#fff" strokeWidth={2.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+              </svg>
+            </div>
+            <p className="text-4xl font-bold tracking-tight" style={{ color: "#fff" }}>Step Complete!</p>
+            <p className="text-base font-medium opacity-70" style={{ color: "#fff" }}>Moving to next step…</p>
+          </div>
+        </div>
+      )}
+
       <div className="relative flex h-screen w-screen overflow-hidden" style={{ background: "#FFF8F0" }}>
-        <CameraPip position="right-center" />
+        <CameraPip position="right-center" connected={cameraActive} />
+
+        {/* End recipe button */}
+        <button
+          onClick={handleEndRecipe}
+          className="absolute top-5 right-5 z-20 flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold transition-all hover:brightness-90 active:scale-95"
+          style={{ background: "#e8e0d8", color: "#7a6a5a" }}
+        >
+          ✕ End Recipe
+        </button>
 
         <div className="flex-1 flex flex-col">
 
@@ -529,20 +620,50 @@ export default function Home() {
                 </p>
               )}
 
-              {/* Live AI vision feedback */}
-              {stepCheckData && (
-                <div className="flex flex-col gap-1 mt-1">
+              {/* Live AI vision analysis card */}
+              {stepCheckData ? (
+                <div
+                  className="rounded-2xl p-4 flex flex-col gap-3 mt-2"
+                  style={{
+                    background: stepCompleted ? "#2C5F2E12" : "#fff",
+                    border: `1.5px solid ${stepCompleted ? "#2C5F2E50" : "#e8e0d8"}`,
+                    boxShadow: "0 2px 12px #0000000a",
+                    transition: "border-color 0.4s ease, background 0.4s ease",
+                  }}
+                >
+                  {/* Card header */}
+                  <div className="flex items-center gap-2">
+                    <span className="ai-dot w-2 h-2 rounded-full shrink-0" style={{ background: stepCompleted ? "#2C5F2E" : "#D4A017" }} />
+                    <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: stepCompleted ? "#2C5F2E" : "#D4A017" }}>
+                      {stepCompleted ? "Step confirmed ✓" : "Live AI Analysis"}
+                    </span>
+                  </div>
+
+                  {/* State description — what the AI sees right now */}
                   {stepCheckData.state?.explanation && (
-                    <p className="text-sm" style={{ color: "#7a9a5a" }}>
-                      <span className="font-semibold">State:</span> {stepCheckData.state.explanation}
+                    <p className="text-sm leading-relaxed" style={{ color: "#5a5a4a" }}>
+                      {stepCheckData.state.explanation}
                     </p>
                   )}
+
+                  {/* Action description — what the AI says you should do / are doing */}
                   {stepCheckData.action?.explanation &&
                     stepCheckData.action.explanation !== stepCheckData.state?.explanation && (
-                    <p className="text-sm" style={{ color: "#7a9a5a" }}>
-                      <span className="font-semibold">Action:</span> {stepCheckData.action.explanation}
-                    </p>
+                    <div className="flex items-start gap-2 rounded-xl px-3 py-2" style={{ background: stepCompleted ? "#2C5F2E15" : "#D4A01712" }}>
+                      <span className="text-base shrink-0 mt-0.5">{stepCompleted ? "✅" : "👉"}</span>
+                      <p className="text-sm leading-relaxed font-medium" style={{ color: stepCompleted ? "#2C5F2E" : "#3a3a2a" }}>
+                        {stepCheckData.action.explanation}
+                      </p>
+                    </div>
                   )}
+                </div>
+              ) : (
+                <div
+                  className="rounded-2xl px-4 py-3 flex items-center gap-2 mt-2"
+                  style={{ background: "#f5f0ea", border: "1.5px solid #e8e0d8" }}
+                >
+                  <span className="ai-dot w-2 h-2 rounded-full shrink-0" style={{ background: "#97BC62" }} />
+                  <p className="text-sm" style={{ color: "#97BC62" }}>Starting AI analysis…</p>
                 </div>
               )}
             </div>
@@ -625,9 +746,8 @@ function Waveform() {
 // Camera PiP
 // ---------------------------------------------------------------------------
 
-function CameraPip({ position }: { position?: "top-left" | "right-center" }) {
+function CameraPip({ position, connected = false }: { position?: "top-left" | "right-center"; connected?: boolean }) {
   const isRight = position === "right-center";
-  const connected = false; // swap to true when real stream is connected
 
   return (
     <div
@@ -645,7 +765,12 @@ function CameraPip({ position }: { position?: "top-left" | "right-center" }) {
       }}
     >
       {connected ? (
-        <div className="w-full h-full" style={{ background: "#97BC6240" }} />
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={`${BACKEND_URL}/camera/feed`}
+          alt="Live camera feed"
+          className="w-full h-full object-cover"
+        />
       ) : (
         <div className="w-full h-full flex flex-col items-center justify-center gap-2">
           <svg className="w-6 h-6 opacity-30" fill="none" viewBox="0 0 24 24" stroke="#fff" strokeWidth={1.5}>
